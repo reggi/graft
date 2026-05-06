@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GRAFT_VERSION="0.1.0"
+GRAFT_MANIFEST=".graft"
+GRAFT_LOCKFILE=".graft.lock"
+GRAFT_CACHE_DIR="${GRAFT_CACHE_DIR:-$HOME/.graft/cache}"
+GRAFT_GITIGNORE_MARKER="# managed by graft"
+
+# --- Utility functions ---
+
+die() { echo "graft: error: $*" >&2; exit 1; }
+warn() { echo "graft: warning: $*" >&2; }
+info() { echo "graft: $*"; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not found"
+}
+
+require_manifest() {
+  [[ -f "$GRAFT_MANIFEST" ]] || die "no $GRAFT_MANIFEST found (run 'graft init' first)"
+}
+
+require_lockfile() {
+  [[ -f "$GRAFT_LOCKFILE" ]] || die "no $GRAFT_LOCKFILE found (run 'graft update' first)"
+}
+
+sha256_file() {
+  shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+sha256_stdin() {
+  shasum -a 256 | cut -d' ' -f1
+}
+
+# --- Source type detection ---
+
+source_type() {
+  local source="$1"
+  case "$source" in
+    https://github.com/*|git@github.com:*)
+      echo "github"
+      ;;
+    file://*)
+      echo "local"
+      ;;
+    *)
+      echo "git"
+      ;;
+  esac
+}
+
+# Extract owner/repo from GitHub URLs
+github_owner_repo() {
+  local source="$1"
+  case "$source" in
+    https://github.com/*)
+      echo "$source" | sed 's|https://github.com/||; s|\.git$||'
+      ;;
+    git@github.com:*)
+      echo "$source" | sed 's|git@github.com:||; s|\.git$||'
+      ;;
+  esac
+}
+
+# Extract local path from file:// URL
+local_path() {
+  echo "$1" | sed 's|^file://||'
+}
+
+# --- Fetch strategies ---
+
+# Resolve a ref to a commit SHA
+resolve_ref() {
+  local source="$1" ref="$2"
+  local stype
+  stype=$(source_type "$source")
+
+  case "$stype" in
+    github)
+      local owner_repo
+      owner_repo=$(github_owner_repo "$source")
+      gh api "/repos/${owner_repo}/commits/${ref}" --jq '.sha' 2>/dev/null \
+        || die "failed to resolve ref '$ref' for $source"
+      ;;
+    local)
+      local repo_path
+      repo_path=$(local_path "$source")
+      git -C "$repo_path" rev-parse "${ref:-HEAD}" 2>/dev/null \
+        || die "failed to resolve ref '$ref' in $repo_path"
+      ;;
+    git)
+      local cache_dir
+      cache_dir=$(git_cache_dir "$source")
+      ensure_cache "$source" "$cache_dir"
+      git -C "$cache_dir" rev-parse "$ref" 2>/dev/null \
+        || die "failed to resolve ref '$ref' for $source"
+      ;;
+  esac
+}
+
+# Fetch a single file's content
+fetch_file() {
+  local source="$1" sha="$2" filepath="$3"
+  local stype
+  stype=$(source_type "$source")
+
+  case "$stype" in
+    github)
+      local owner_repo
+      owner_repo=$(github_owner_repo "$source")
+      gh api "/repos/${owner_repo}/contents/${filepath}?ref=${sha}" --jq '.content' 2>/dev/null \
+        | base64 -d 2>/dev/null \
+        || die "failed to fetch '$filepath' from $source at $sha"
+      ;;
+    local)
+      local repo_path
+      repo_path=$(local_path "$source")
+      git -C "$repo_path" show "${sha}:${filepath}" 2>/dev/null \
+        || die "failed to fetch '$filepath' from $repo_path at $sha"
+      ;;
+    git)
+      local cache_dir
+      cache_dir=$(git_cache_dir "$source")
+      git -C "$cache_dir" show "${sha}:${filepath}" 2>/dev/null \
+        || die "failed to fetch '$filepath' from $source at $sha"
+      ;;
+  esac
+}
+
+# Check if a file exists in a source at a given SHA
+file_exists_in_source() {
+  local source="$1" sha="$2" filepath="$3"
+  local stype
+  stype=$(source_type "$source")
+
+  case "$stype" in
+    github)
+      local owner_repo
+      owner_repo=$(github_owner_repo "$source")
+      gh api "/repos/${owner_repo}/contents/${filepath}?ref=${sha}" --jq '.sha' >/dev/null 2>&1
+      ;;
+    local)
+      local repo_path
+      repo_path=$(local_path "$source")
+      git -C "$repo_path" cat-file -e "${sha}:${filepath}" 2>/dev/null
+      ;;
+    git)
+      local cache_dir
+      cache_dir=$(git_cache_dir "$source")
+      git -C "$cache_dir" cat-file -e "${sha}:${filepath}" 2>/dev/null
+      ;;
+  esac
+}
+
+# --- Git bare cache (for non-GitHub, non-local sources) ---
+
+git_cache_dir() {
+  local source="$1"
+  local hash
+  hash=$(echo -n "$source" | sha256_stdin)
+  echo "${GRAFT_CACHE_DIR}/${hash}"
+}
+
+ensure_cache() {
+  local source="$1" cache_dir="$2"
+  if [[ -d "$cache_dir" ]]; then
+    git -C "$cache_dir" fetch --quiet --all 2>/dev/null \
+      || die "failed to fetch updates for $source"
+  else
+    mkdir -p "$cache_dir"
+    git clone --bare --quiet "$source" "$cache_dir" 2>/dev/null \
+      || die "failed to clone $source"
+  fi
+}
+
+# --- Gitignore management ---
+
+gitignore_add() {
+  local filepath="$1"
+  local gitignore=".gitignore"
+
+  # Create .gitignore if it doesn't exist
+  [[ -f "$gitignore" ]] || touch "$gitignore"
+
+  # Check if the marker section exists
+  if ! grep -qF "$GRAFT_GITIGNORE_MARKER" "$gitignore"; then
+    # Add the marker section
+    printf '\n%s\n' "$GRAFT_GITIGNORE_MARKER" >> "$gitignore"
+  fi
+
+  # Add the file if not already present in the graft section
+  if ! grep -qxF "$filepath" "$gitignore"; then
+    # Insert after the marker line
+    local tmp
+    tmp=$(mktemp)
+    awk -v marker="$GRAFT_GITIGNORE_MARKER" -v entry="$filepath" '
+      { print }
+      $0 == marker { print entry }
+    ' "$gitignore" > "$tmp"
+    mv "$tmp" "$gitignore"
+  fi
+}
+
+gitignore_remove() {
+  local filepath="$1"
+  local gitignore=".gitignore"
+  [[ -f "$gitignore" ]] || return 0
+  if grep -qxF "$filepath" "$gitignore"; then
+    local tmp
+    tmp=$(mktemp)
+    grep -vxF "$filepath" "$gitignore" > "$tmp"
+    mv "$tmp" "$gitignore"
+  fi
+}
+
+# Sync .gitignore based on all managed files
+gitignore_sync() {
+  # Read vendor flag from the manifest, not the lockfile
+  [[ -f "$GRAFT_MANIFEST" ]] || return 0
+
+  local count
+  count=$(jq '.grafts | length' "$GRAFT_MANIFEST")
+
+  for (( i=0; i<count; i++ )); do
+    local file_count
+    file_count=$(jq ".grafts[$i].files | length" "$GRAFT_MANIFEST")
+
+    for (( j=0; j<file_count; j++ )); do
+      local dest vendor
+      dest=$(jq -r ".grafts[$i].files[$j].dest // .grafts[$i].files[$j].src" "$GRAFT_MANIFEST")
+      vendor=$(jq -r ".grafts[$i].files[$j].vendor // false" "$GRAFT_MANIFEST")
+
+      if [[ "$vendor" == "true" ]]; then
+        gitignore_remove "$dest"
+      else
+        gitignore_add "$dest"
+      fi
+    done
+  done
+}
+
+# --- Path validation ---
+
+validate_dest_path() {
+  local dest="$1"
+  # Reject absolute paths
+  [[ "$dest" != /* ]] || die "destination path must be relative: $dest"
+  # Reject path traversal
+  [[ "$dest" != *..* ]] || die "destination path must not contain '..': $dest"
+}
+
+# Check for duplicate destinations across all grafts
+check_duplicate_dests() {
+  local manifest="$1"
+  local dests
+  dests=$(jq -r '.grafts[].files[] | .dest // .src' "$manifest" | sort)
+  local dupes
+  dupes=$(echo "$dests" | uniq -d)
+  if [[ -n "$dupes" ]]; then
+    die "duplicate destination paths: $dupes"
+  fi
+}
+
+# --- Write file to destination ---
+
+write_file() {
+  local content="$1" dest="$2" force="${3:-false}"
+
+  validate_dest_path "$dest"
+
+  # Check if file exists and has local modifications
+  if [[ -f "$dest" && "$force" != "true" ]]; then
+    if [[ -f "$GRAFT_LOCKFILE" ]]; then
+      local expected_sha actual_sha
+      expected_sha=$(jq -r --arg dest "$dest" \
+        '.grafts[].files[] | select(.dest == $dest) | .sha256 // empty' \
+        "$GRAFT_LOCKFILE" | head -1)
+      if [[ -n "$expected_sha" ]]; then
+        actual_sha=$(sha256_file "$dest")
+        if [[ "$actual_sha" != "$expected_sha" ]]; then
+          warn "skipping '$dest' (locally modified, use --force to overwrite)"
+          return 1
+        fi
+      fi
+    fi
+  fi
+
+  # Create parent directories
+  mkdir -p "$(dirname "$dest")"
+
+  # Write content
+  echo "$content" > "$dest"
+}
+
+# --- Parse GitHub blob URL ---
+# e.g., https://github.com/org/repo/blob/main/path/to/file
+parse_github_blob_url() {
+  local url="$1"
+
+  if [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$ ]]; then
+    local owner="${BASH_REMATCH[1]}"
+    local repo="${BASH_REMATCH[2]}"
+    local ref="${BASH_REMATCH[3]}"
+    local path="${BASH_REMATCH[4]}"
+
+    echo "https://github.com/${owner}/${repo}.git"
+    echo "$ref"
+    echo "$path"
+  else
+    return 1
+  fi
+}
+
+# --- Commands ---
+
+cmd_init() {
+  if [[ -f "$GRAFT_MANIFEST" ]]; then
+    die "$GRAFT_MANIFEST already exists"
+  fi
+
+  cat > "$GRAFT_MANIFEST" <<'EOF'
+{
+  "grafts": []
+}
+EOF
+  info "created $GRAFT_MANIFEST"
+}
+
+cmd_add() {
+  local vendor=false
+  local url="" dest=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vendor) vendor=true; shift ;;
+      *) 
+        if [[ -z "$url" ]]; then
+          url="$1"
+        elif [[ -z "$dest" ]]; then
+          dest="$1"
+        else
+          die "unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$url" ]] || die "usage: graft add [--vendor] <github-url> [dest-path]"
+
+  # Parse the GitHub blob URL
+  local parsed
+  parsed=$(parse_github_blob_url "$url") \
+    || die "invalid GitHub blob URL: $url\nExpected: https://github.com/owner/repo/blob/ref/path/to/file"
+
+  local source ref src
+  source=$(echo "$parsed" | sed -n '1p')
+  ref=$(echo "$parsed" | sed -n '2p')
+  src=$(echo "$parsed" | sed -n '3p')
+
+  # Default dest to the filename
+  if [[ -z "$dest" ]]; then
+    dest=$(basename "$src")
+  fi
+
+  # Ensure manifest exists
+  if [[ ! -f "$GRAFT_MANIFEST" ]]; then
+    cmd_init
+  fi
+
+  # Check if a graft for this source already exists
+  local existing_idx
+  existing_idx=$(jq -r --arg source "$source" \
+    '.grafts | to_entries[] | select(.value.source == $source) | .key' \
+    "$GRAFT_MANIFEST" | head -1)
+
+  local name
+  name=$(echo "$source" | sed 's|.*/||; s|\.git$||')
+
+  if [[ -n "$existing_idx" ]]; then
+    # Check if this exact file mapping already exists
+    local existing_file
+    existing_file=$(jq -r --argjson idx "$existing_idx" --arg src "$src" --arg dest "$dest" \
+      '.grafts[$idx].files[] | select(.src == $src and ((.dest // .src) == $dest)) | .src' \
+      "$GRAFT_MANIFEST" | head -1)
+
+    if [[ -n "$existing_file" ]]; then
+      # Check if vendor flag changed
+      local current_vendor
+      current_vendor=$(jq -r --argjson idx "$existing_idx" --arg src "$src" --arg dest "$dest" \
+        '.grafts[$idx].files[] | select(.src == $src and ((.dest // .src) == $dest)) | .vendor // false' \
+        "$GRAFT_MANIFEST" | head -1)
+
+      if [[ "$current_vendor" == "$vendor" ]]; then
+        info "$src → $dest already exists in $name, nothing to do"
+        return 0
+      fi
+
+      # Update vendor flag
+      local tmp
+      tmp=$(mktemp)
+      jq --argjson idx "$existing_idx" --arg src "$src" --arg dest "$dest" --argjson vendor "$vendor" \
+        '.grafts[$idx].files = [.grafts[$idx].files[] | if (.src == $src and ((.dest // .src) == $dest)) then .vendor = $vendor else . end]' \
+        "$GRAFT_MANIFEST" > "$tmp"
+      mv "$tmp" "$GRAFT_MANIFEST"
+      info "updated $src → $dest vendor=$vendor"
+
+      # Re-run update to sync gitignore
+      cmd_update "$name"
+      return 0
+    fi
+
+    # Add file to existing graft
+    local file_obj
+    if [[ "$dest" == "$src" || "$dest" == "$(basename "$src")" && "$src" == "$dest" ]]; then
+      file_obj=$(jq -n --arg src "$src" --argjson vendor "$vendor" \
+        'if $vendor then {src: $src, vendor: true} else {src: $src} end')
+    else
+      file_obj=$(jq -n --arg src "$src" --arg dest "$dest" --argjson vendor "$vendor" \
+        'if $vendor then {src: $src, dest: $dest, vendor: true} else {src: $src, dest: $dest} end')
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson idx "$existing_idx" --argjson file "$file_obj" \
+      '.grafts[$idx].files += [$file]' "$GRAFT_MANIFEST" > "$tmp"
+    mv "$tmp" "$GRAFT_MANIFEST"
+  else
+    # Create new graft entry
+    local file_obj
+    if [[ "$dest" == "$(basename "$src")" ]]; then
+      file_obj=$(jq -n --arg src "$src" --argjson vendor "$vendor" \
+        'if $vendor then {src: $src, vendor: true} else {src: $src} end')
+    else
+      file_obj=$(jq -n --arg src "$src" --arg dest "$dest" --argjson vendor "$vendor" \
+        'if $vendor then {src: $src, dest: $dest, vendor: true} else {src: $src, dest: $dest} end')
+    fi
+
+    local new_graft
+    new_graft=$(jq -n --arg name "$name" --arg source "$source" --arg ref "$ref" \
+      --argjson file "$file_obj" \
+      '{name: $name, source: $source, ref: $ref, files: [$file]}')
+
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson graft "$new_graft" '.grafts += [$graft]' "$GRAFT_MANIFEST" > "$tmp"
+    mv "$tmp" "$GRAFT_MANIFEST"
+  fi
+
+  info "added $src → $dest from $source@$ref"
+
+  # Immediately fetch the file
+  cmd_update "$name"
+}
+
+cmd_update() {
+  require_manifest
+
+  local filter_name="" filter_file="" force=false
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true ;;
+      *)
+        if [[ -z "$filter_name" ]]; then
+          filter_name="$1"
+        elif [[ -z "$filter_file" ]]; then
+          filter_file="$1"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  check_duplicate_dests "$GRAFT_MANIFEST"
+
+  local graft_count
+  graft_count=$(jq '.grafts | length' "$GRAFT_MANIFEST")
+
+  # Build the lockfile
+  local lock_grafts="[]"
+
+  for (( i=0; i<graft_count; i++ )); do
+    local name source ref
+    name=$(jq -r ".grafts[$i].name" "$GRAFT_MANIFEST")
+    source=$(jq -r ".grafts[$i].source" "$GRAFT_MANIFEST")
+    ref=$(jq -r ".grafts[$i].ref" "$GRAFT_MANIFEST")
+
+    # Filter by name if specified
+    if [[ -n "$filter_name" && "$filter_name" != "--force" && "$name" != "$filter_name" ]]; then
+      # Preserve existing lock entry if it exists
+      if [[ -f "$GRAFT_LOCKFILE" ]]; then
+        local existing
+        existing=$(jq --arg name "$name" '.grafts[] | select(.name == $name)' "$GRAFT_LOCKFILE" 2>/dev/null || echo "")
+        if [[ -n "$existing" ]]; then
+          lock_grafts=$(echo "$lock_grafts" | jq --argjson entry "$existing" '. += [$entry]')
+        fi
+      fi
+      continue
+    fi
+
+    info "updating $name ($source@$ref)..."
+
+    # Resolve ref to SHA
+    local sha
+    sha=$(resolve_ref "$source" "$ref")
+    info "  resolved $ref → ${sha:0:12}"
+
+    # Process each file
+    local file_count
+    file_count=$(jq ".grafts[$i].files | length" "$GRAFT_MANIFEST")
+    local lock_files="[]"
+
+    for (( j=0; j<file_count; j++ )); do
+      local src dest vendor
+      src=$(jq -r ".grafts[$i].files[$j].src" "$GRAFT_MANIFEST")
+      dest=$(jq -r ".grafts[$i].files[$j].dest // .grafts[$i].files[$j].src" "$GRAFT_MANIFEST")
+      vendor=$(jq -r ".grafts[$i].files[$j].vendor // false" "$GRAFT_MANIFEST")
+
+      # Filter by file if specified
+      if [[ -n "$filter_file" && "$dest" != "$filter_file" ]]; then
+        continue
+      fi
+
+      validate_dest_path "$dest"
+
+      # Fetch file content
+      local content
+      content=$(fetch_file "$source" "$sha" "$src")
+
+      # Write to destination
+      if write_file "$content" "$dest" "$force"; then
+        info "  $src → $dest"
+      fi
+
+      # Calculate checksum of written content
+      local checksum
+      checksum=$(echo "$content" | sha256_stdin)
+
+      # Build lock entry for this file
+      local lock_file
+      lock_file=$(jq -n --arg src "$src" --arg dest "$dest" --arg sha256 "$checksum" \
+        '{src: $src, dest: $dest, sha256: $sha256}')
+      lock_files=$(echo "$lock_files" | jq --argjson f "$lock_file" '. += [$f]')
+    done
+
+    # Build lock entry for this graft
+    local lock_graft
+    lock_graft=$(jq -n --arg name "$name" --arg source "$source" \
+      --arg requested_ref "$ref" --arg resolved_sha "$sha" \
+      --argjson files "$lock_files" \
+      '{name: $name, source: $source, requested_ref: $requested_ref, resolved_sha: $resolved_sha, files: $files}')
+    lock_grafts=$(echo "$lock_grafts" | jq --argjson g "$lock_graft" '. += [$g]')
+  done
+
+  # Write lockfile
+  echo "$lock_grafts" | jq '{grafts: .}' > "$GRAFT_LOCKFILE"
+  info "updated $GRAFT_LOCKFILE"
+
+  # Sync .gitignore
+  gitignore_sync
+}
+
+cmd_install() {
+  require_lockfile
+
+  local force=false
+  [[ "${1:-}" == "--force" ]] && force=true
+
+  local graft_count
+  graft_count=$(jq '.grafts | length' "$GRAFT_LOCKFILE")
+
+  for (( i=0; i<graft_count; i++ )); do
+    local name source sha
+    name=$(jq -r ".grafts[$i].name" "$GRAFT_LOCKFILE")
+    source=$(jq -r ".grafts[$i].source" "$GRAFT_LOCKFILE")
+    sha=$(jq -r ".grafts[$i].resolved_sha" "$GRAFT_LOCKFILE")
+
+    info "installing $name..."
+
+    local file_count
+    file_count=$(jq ".grafts[$i].files | length" "$GRAFT_LOCKFILE")
+
+    for (( j=0; j<file_count; j++ )); do
+      local src dest
+      src=$(jq -r ".grafts[$i].files[$j].src" "$GRAFT_LOCKFILE")
+      dest=$(jq -r ".grafts[$i].files[$j].dest" "$GRAFT_LOCKFILE")
+
+      # Fetch file content at the locked SHA
+      local content
+      content=$(fetch_file "$source" "$sha" "$src")
+
+      if write_file "$content" "$dest" "$force"; then
+        info "  $src → $dest"
+      fi
+    done
+  done
+
+  # Sync .gitignore
+  gitignore_sync
+  info "install complete"
+}
+
+cmd_status() {
+  require_lockfile
+
+  local has_drift=false
+  local graft_count
+  graft_count=$(jq '.grafts | length' "$GRAFT_LOCKFILE")
+
+  for (( i=0; i<graft_count; i++ )); do
+    local name
+    name=$(jq -r ".grafts[$i].name" "$GRAFT_LOCKFILE")
+
+    local file_count
+    file_count=$(jq ".grafts[$i].files | length" "$GRAFT_LOCKFILE")
+
+    for (( j=0; j<file_count; j++ )); do
+      local dest expected_sha vendor
+      dest=$(jq -r ".grafts[$i].files[$j].dest" "$GRAFT_LOCKFILE")
+      expected_sha=$(jq -r ".grafts[$i].files[$j].sha256" "$GRAFT_LOCKFILE")
+      # Read vendor from manifest, not lockfile
+      vendor=$(jq -r --arg name "$name" --arg dest "$dest" \
+        '.grafts[] | select(.name == $name) | .files[] | select((.dest // .src) == $dest) | .vendor // false' \
+        "$GRAFT_MANIFEST" 2>/dev/null | head -1)
+      [[ -n "$vendor" ]] || vendor="false"
+
+      local status_icon mode
+      mode=$([[ "$vendor" == "true" ]] && echo "vendored" || echo "gitignored")
+
+      if [[ ! -f "$dest" ]]; then
+        status_icon="✗ missing"
+        has_drift=true
+      else
+        local actual_sha
+        actual_sha=$(sha256_file "$dest")
+        if [[ "$actual_sha" == "$expected_sha" ]]; then
+          status_icon="✓ ok"
+        else
+          status_icon="✗ modified"
+          has_drift=true
+        fi
+      fi
+
+      printf "  %-12s %-10s %s (%s)\n" "$status_icon" "[$mode]" "$dest" "$name"
+    done
+  done
+
+  if [[ "$has_drift" == "true" ]]; then
+    return 1
+  fi
+}
+
+cmd_diff() {
+  require_lockfile
+
+  local filter_name="${1:-}"
+  local graft_count
+  graft_count=$(jq '.grafts | length' "$GRAFT_LOCKFILE")
+
+  for (( i=0; i<graft_count; i++ )); do
+    local name source sha
+    name=$(jq -r ".grafts[$i].name" "$GRAFT_LOCKFILE")
+    source=$(jq -r ".grafts[$i].source" "$GRAFT_LOCKFILE")
+    sha=$(jq -r ".grafts[$i].resolved_sha" "$GRAFT_LOCKFILE")
+
+    if [[ -n "$filter_name" && "$name" != "$filter_name" ]]; then
+      continue
+    fi
+
+    local file_count
+    file_count=$(jq ".grafts[$i].files | length" "$GRAFT_LOCKFILE")
+
+    for (( j=0; j<file_count; j++ )); do
+      local src dest
+      src=$(jq -r ".grafts[$i].files[$j].src" "$GRAFT_LOCKFILE")
+      dest=$(jq -r ".grafts[$i].files[$j].dest" "$GRAFT_LOCKFILE")
+
+      if [[ ! -f "$dest" ]]; then
+        echo "--- $dest (missing)"
+        continue
+      fi
+
+      local source_content
+      source_content=$(fetch_file "$source" "$sha" "$src")
+
+      local tmp_source
+      tmp_source=$(mktemp)
+      echo "$source_content" > "$tmp_source"
+
+      diff -u --label "source:$src@${sha:0:12}" --label "local:$dest" \
+        "$tmp_source" "$dest" || true
+
+      rm -f "$tmp_source"
+    done
+  done
+}
+
+cmd_check() {
+  require_lockfile
+
+  if cmd_status >/dev/null 2>&1; then
+    info "all files in sync"
+    exit 0
+  else
+    echo "Files out of sync:" >&2
+    cmd_status >&2
+    exit 1
+  fi
+}
+
+cmd_version() {
+  echo "graft $GRAFT_VERSION"
+}
+
+cmd_help() {
+  cat <<'EOF'
+graft — git-based file sync tool
+
+Usage:
+  graft <command> [options]
+
+Commands:
+  init                              Create a new .graft manifest
+  add [--vendor] <url> [dest]       Add a file from a GitHub blob URL
+  update [name] [file] [--force]    Resolve refs, update lockfile, sync files
+  install [--force]                 Install files from lockfile
+  status                            Show file sync status
+  diff [name]                       Show diffs between local and source
+  check                             CI-friendly sync check (exit code)
+  version                           Show version
+  help                              Show this help
+
+Source URL formats:
+  https://github.com/org/repo.git   GitHub (uses gh CLI)
+  git@github.com:org/repo.git       GitHub SSH
+  file:///path/to/repo              Local git repo
+  git@host:org/repo.git             Other git (bare cache)
+
+Examples:
+  graft add https://github.com/org/repo/blob/main/tsconfig.json
+  graft add --vendor https://github.com/org/repo/blob/v2/ci.yml .github/workflows/ci.yml
+  graft update
+  graft install
+EOF
+}
+
+# --- Main ---
+
+main() {
+  require_cmd git
+  require_cmd jq
+
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init)    cmd_init "$@" ;;
+    add)     cmd_add "$@" ;;
+    update)  cmd_update "$@" ;;
+    install) cmd_install "$@" ;;
+    status)  cmd_status "$@" ;;
+    diff)    cmd_diff "$@" ;;
+    check)   cmd_check "$@" ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h)       cmd_help ;;
+    *)       die "unknown command: $cmd (run 'graft help')" ;;
+  esac
+}
+
+main "$@"

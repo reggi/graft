@@ -1,0 +1,13 @@
+{
+  "grafts": [
+    {
+      "name": "example",
+      "source": "https://github.com/org/shared-configs.git",
+      "ref": "main",
+      "files": [
+        { "src": "tsconfig.json", "vendor": true },
+        { "src": ".eslintrc.js", "dest": "config/.eslintrc.js" }
+      ]
+    }
+  ]
+}
