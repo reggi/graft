@@ -1,7 +1,7 @@
 .PHONY: test install
 
 install:
-	cp graft /usr/local/bin/graft
+	cp bin/graft /usr/local/bin/graft
 	chmod +x /usr/local/bin/graft
 
 test:

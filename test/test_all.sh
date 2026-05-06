@@ -2,7 +2,7 @@
 # Integration tests for graft
 set -euo pipefail
 
-GRAFT="$(cd "$(dirname "$0")/.." && pwd)/graft"
+GRAFT="$(cd "$(dirname "$0")/.." && pwd)/bin/graft"
 TEST_DIR=$(mktemp -d)
 PASS=0
 FAIL=0
