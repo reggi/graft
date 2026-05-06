@@ -50,6 +50,35 @@ source_type() {
   esac
 }
 
+gh_available() {
+  command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+}
+
+# Session-scoped temp clone for GitHub repos when gh is unavailable
+_TEMP_CLONE_DIR=""
+
+_cleanup_temp_clones() {
+  if [[ -n "$_TEMP_CLONE_DIR" ]]; then
+    rm -rf "$_TEMP_CLONE_DIR" 2>/dev/null
+  fi
+}
+trap _cleanup_temp_clones EXIT
+
+_get_temp_clone() {
+  local source="$1"
+  local key
+  key=$(echo -n "$source" | sha256_stdin)
+  local clone_path="${_TEMP_CLONE_DIR}/${key}"
+  if [[ -z "$_TEMP_CLONE_DIR" ]]; then
+    _TEMP_CLONE_DIR=$(mktemp -d)
+  fi
+  if [[ ! -d "$clone_path" ]]; then
+    git clone --bare --quiet --depth 1 "$source" "$clone_path" 2>/dev/null \
+      || die "failed to clone $source (gh CLI not available, using git fallback)"
+  fi
+  echo "$clone_path"
+}
+
 # Extract owner/repo from GitHub URLs
 github_owner_repo() {
   local source="$1"
@@ -80,8 +109,13 @@ resolve_ref() {
     github)
       local owner_repo
       owner_repo=$(github_owner_repo "$source")
-      gh api "/repos/${owner_repo}/commits/${ref}" --jq '.sha' 2>/dev/null \
-        || die "failed to resolve ref '$ref' for $source"
+      if gh_available; then
+        gh api "/repos/${owner_repo}/commits/${ref}" --jq '.sha' 2>/dev/null \
+          || die "failed to resolve ref '$ref' for $source"
+      else
+        git ls-remote "$source" "$ref" 2>/dev/null | awk '{print $1}' | head -1 \
+          || die "failed to resolve ref '$ref' for $source"
+      fi
       ;;
     local)
       local repo_path
@@ -109,9 +143,17 @@ fetch_file() {
     github)
       local owner_repo
       owner_repo=$(github_owner_repo "$source")
-      gh api "/repos/${owner_repo}/contents/${filepath}?ref=${sha}" --jq '.content' 2>/dev/null \
-        | base64 -d 2>/dev/null \
-        || die "failed to fetch '$filepath' from $source at $sha"
+      if gh_available; then
+        gh api "/repos/${owner_repo}/contents/${filepath}?ref=${sha}" --jq '.content' 2>/dev/null \
+          | base64 -d 2>/dev/null \
+          || die "failed to fetch '$filepath' from $source at $sha"
+      else
+        local clone_dir
+        clone_dir=$(_get_temp_clone "$source")
+        git -C "$clone_dir" fetch --quiet --depth 1 origin "$sha" 2>/dev/null || true
+        git -C "$clone_dir" show "${sha}:${filepath}" 2>/dev/null \
+          || die "failed to fetch '$filepath' from $source at $sha (using git fallback)"
+      fi
       ;;
     local)
       local repo_path
@@ -138,7 +180,14 @@ file_exists_in_source() {
     github)
       local owner_repo
       owner_repo=$(github_owner_repo "$source")
-      gh api "/repos/${owner_repo}/contents/${filepath}?ref=${sha}" --jq '.sha' >/dev/null 2>&1
+      if gh_available; then
+        gh api "/repos/${owner_repo}/contents/${filepath}?ref=${sha}" --jq '.sha' >/dev/null 2>&1
+      else
+        local clone_dir
+        clone_dir=$(_get_temp_clone "$source")
+        git -C "$clone_dir" fetch --quiet --depth 1 origin "$sha" 2>/dev/null || true
+        git -C "$clone_dir" cat-file -e "${sha}:${filepath}" 2>/dev/null
+      fi
       ;;
     local)
       local repo_path
@@ -169,7 +218,7 @@ ensure_cache() {
       || die "failed to fetch updates for $source"
   else
     mkdir -p "$cache_dir"
-    git clone --bare --quiet "$source" "$cache_dir" 2>/dev/null \
+    git clone --bare --quiet --depth 1 "$source" "$cache_dir" 2>/dev/null \
       || die "failed to clone $source"
   fi
 }
